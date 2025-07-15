@@ -1,0 +1,242 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include <TinyGPSPlus.h>
+#include <WiFiNINA.h>
+#include <WiFiClient.h>
+#include <ThingSpeak.h>
+
+// === Sensores ===
+Adafruit_MPU6050 mpu;
+MAX30105 sensor;
+TinyGPSPlus gps;
+#define gpsSerial Serial1
+
+// === WiFi ===
+const char* ssid = "WIFI Lucas";
+const char* password = "758sakul";
+
+// === ThingSpeak ===
+unsigned long myChannelNumber = 3007150;
+const char* myWriteAPIKey = "CTIZFY0PAGRNE1TC";
+WiFiClient client;
+
+// === BPM IR ===
+#define SAMPLE_INTERVAL 40
+#define WINDOW_SIZE 10
+long irBuffer[WINDOW_SIZE];
+int irIdx = 0;
+
+static long lastValues[3] = {0, 0, 0};
+unsigned long lastBeatTime = 0;
+float bpm = 0;
+float bpmSum = 0;
+int bpmCount = 0;
+
+bool isPeak(long val, long prev, long next) {
+  return (val > prev) && (val > next);
+}
+
+// === GPS y Movimiento ===
+double currentLat = 0, currentLng = 0;
+double lastValidLat = 0, lastValidLng = 0;
+unsigned long tiempoUltimoEnvio = 0;
+unsigned long lastGpsUpdateTime = 0;
+double distanciaTotal = 0;
+double distanciaRapida = 0;
+double velocidad = 0;
+
+// === WiFi Setup ===
+void setupWiFi() {
+  Serial.print("Conectando a WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\n✅ Conectado a WiFi");
+}
+
+// === ThingSpeak Envío ===
+void enviarDatos(float distTotal, float velocidadActual, float distRapida, float hr,
+                 float accelTotal, float accelIzq, float accelDer, float salto) {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi no conectado. Reintentando...");
+    setupWiFi();
+    return;
+  }
+
+  ThingSpeak.setField(1, distTotal);
+  ThingSpeak.setField(2, velocidadActual);
+  ThingSpeak.setField(3, distRapida);
+  ThingSpeak.setField(4, hr);
+  ThingSpeak.setField(5, accelTotal);
+  ThingSpeak.setField(6, accelIzq);
+  ThingSpeak.setField(7, accelDer);
+  ThingSpeak.setField(8, salto);
+
+  int x = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+  if (x == 200) Serial.println("✅ Datos enviados a ThingSpeak.");
+  else {
+    Serial.print("❌ Error al enviar. Código: "); Serial.println(x);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("🔌 Iniciando sistema wearable...");
+  Wire.begin();
+
+  if (!mpu.begin()) {
+    Serial.println("❌ MPU6050 no detectado."); while (1);
+  }
+  Serial.println("✅ MPU6050 OK");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
+
+  if (!sensor.begin()) {
+    Serial.println("❌ MAX30105 no detectado."); while (1);
+  }
+  sensor.setup();
+  sensor.setPulseAmplitudeIR(0x1F);  // Mayor potencia IR
+  sensor.setPulseAmplitudeRed(0);
+  Serial.println("✅ MAX30105 OK");
+
+  gpsSerial.begin(9600);
+  setupWiFi();
+  ThingSpeak.begin(client);
+
+  tiempoUltimoEnvio = millis();
+  lastGpsUpdateTime = millis();
+
+  for (int i = 0; i < WINDOW_SIZE; i++) irBuffer[i] = 0;
+}
+
+void loop() {
+  // === MPU6050 ===
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  // Offset calibrado para ax (ajusta según tu sensor en reposo)
+  const float AX_OFFSET = -3.44;
+
+  float axCalibrated = ax - AX_OFFSET;
+  float ayCalibrated = ay;  // Si quieres calibrar otros ejes, hazlo aquí
+  float azCalibrated = az;  // Igual aquí
+
+  // Calcular aceleración total con valores calibrados
+  float accelTotal = sqrt(axCalibrated * axCalibrated + ayCalibrated * ayCalibrated + azCalibrated * azCalibrated)-9.49;
+
+  // Ahora sí definimos accelIzq y accelDer solo con axCalibrated
+  float accelIzq = (axCalibrated < 0) ? -axCalibrated : 0;   // Si ax es negativo, toma su valor positivo, sino 0
+  float accelDer = (axCalibrated > 0) ? axCalibrated : 0;    // Si ax es positivo, toma ax, sino 0
+
+
+  float saltoAltura = 0;
+  if (az > 12.0) {
+    float vz = az - 9.81;
+    saltoAltura = (vz * vz) / (2 * 9.81) * 100.0;
+  }
+
+  // === BPM IR ===
+  long ir = sensor.getIR();
+  irBuffer[irIdx] = ir;
+  irIdx = (irIdx + 1) % WINDOW_SIZE;
+
+  long sum = 0;
+  for (int i = 0; i < WINDOW_SIZE; i++) sum += irBuffer[i];
+  long avgIr = sum / WINDOW_SIZE;
+  long threshold = avgIr * 0.60;  // Ajustar sensibilidad umbral
+  int delta = abs(ir - lastValues[2]);
+
+  lastValues[0] = lastValues[1];
+  lastValues[1] = lastValues[2];
+  lastValues[2] = ir;
+
+  Serial.print("IR: "); Serial.print(ir);
+  Serial.print(" | Avg: "); Serial.print(avgIr);
+  Serial.print(" | ΔIR: "); Serial.print(delta);
+  Serial.print(" | Th: "); Serial.print(threshold);
+  Serial.print(" | BPM: "); Serial.println(bpm);
+
+  if (ir > 10000 && ir < 260000) {
+    if (isPeak(lastValues[1], lastValues[0], lastValues[2]) &&
+        lastValues[1] > threshold && delta > 80) {
+
+      unsigned long now = millis();
+      unsigned long diff = now - lastBeatTime;
+      if (diff > 450) {
+        float instantBPM = 60000.0 / diff;
+        lastBeatTime = now;
+
+        if (instantBPM >= 40 && instantBPM <= 200) {
+          bpmSum += instantBPM;
+          bpmCount++;
+          bpm = bpmSum / bpmCount;
+
+          if (bpmCount > 5) {
+            bpmSum -= bpmSum / bpmCount;
+            bpmCount--;
+          }
+
+          Serial.print("❤️ BPM filtrado: ");
+          Serial.println(bpm, 1);
+        } else {
+          Serial.println("⛔ BPM fuera de rango.");
+        }
+      }
+    } else {
+      Serial.println("— No se detectó pico.");
+    }
+  } else {
+    Serial.println("⚠️ Señal IR inválida.");
+  }
+
+  // === GPS ===
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  if (gps.location.isUpdated()) {
+    currentLat = gps.location.lat();
+    currentLng = gps.location.lng();
+
+    if (lastValidLat != 0 || lastValidLng != 0) {
+      double distancia = gps.distanceBetween(currentLat, currentLng, lastValidLat, lastValidLng);
+      double dt = (millis() - lastGpsUpdateTime) / 1000.0;
+      if (dt > 0) velocidad = distancia / dt;
+
+      distanciaTotal += distancia;
+      if (velocidad > 5.0) distanciaRapida += distancia;
+    }
+    lastValidLat = currentLat;
+    lastGpsUpdateTime = millis();
+  }
+
+  // === Debug ===
+  Serial.println("==== MEDICIÓN ====");
+  Serial.print("Accel total: "); Serial.println(accelTotal, 2);
+  Serial.print("Izq: "); Serial.println(accelIzq, 2);
+  Serial.print("Der: "); Serial.println(accelDer, 2);
+  Serial.print("Salto: "); Serial.print(saltoAltura, 1); Serial.println(" cm");
+  Serial.print("Distancia total: "); Serial.println(distanciaTotal, 2);
+  Serial.print("Distancia rápida: "); Serial.println(distanciaRapida, 2);
+  Serial.print("Velocidad: "); Serial.println(velocidad, 2);
+  Serial.println("==================");
+
+  // === Envío a ThingSpeak ===
+  if (millis() - tiempoUltimoEnvio >= 20000) {
+    if (bpm > 0) {
+      enviarDatos(distanciaTotal, velocidad, distanciaRapida, bpm,
+                  accelTotal, accelIzq, accelDer, saltoAltura);
+    } else {
+      Serial.println("⏳ Esperando BPM válido...");
+    }
+    tiempoUltimoEnvio = millis();
+  }
+
+  delay(SAMPLE_INTERVAL);
+}
