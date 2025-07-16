@@ -137,41 +137,24 @@ void loop() {
   float accelIzq = (axCalibrated < 0) ? -axCalibrated : 0;   // Si ax es negativo, toma su valor positivo, sino 0
   float accelDer = (axCalibrated > 0) ? axCalibrated : 0;    // Si ax es positivo, toma ax, sino 0
 
-
-  float saltoAltura = 0;
   if (az > 12.0) {
     float vz = az - 9.81;
     saltoAltura = (vz * vz) / (2 * 9.81) * 100.0;
+    if (saltoAltura > saltoMaximo) saltoMaximo = saltoAltura;
+    if (saltoActual > saltoMaximo) {
+      saltoMaximo = saltoActual;
+    }
   }
 
   // === BPM IR ===
-  long ir = sensor.getIR();
-  irBuffer[irIdx] = ir;
-  irIdx = (irIdx + 1) % WINDOW_SIZE;
-
-  long sum = 0;
-  for (int i = 0; i < WINDOW_SIZE; i++) sum += irBuffer[i];
-  long avgIr = sum / WINDOW_SIZE;
-  long threshold = avgIr * 0.60;  // Ajustar sensibilidad umbral
-  int delta = abs(ir - lastValues[2]);
-
-  lastValues[0] = lastValues[1];
-  lastValues[1] = lastValues[2];
-  lastValues[2] = ir;
-
-  Serial.print("IR: "); Serial.print(ir);
-  Serial.print(" | Avg: "); Serial.print(avgIr);
-  Serial.print(" | ΔIR: "); Serial.print(delta);
-  Serial.print(" | Th: "); Serial.print(threshold);
-  Serial.print(" | BPM: "); Serial.println(bpm);
-
+  irValido = false;
   if (ir > 10000 && ir < 260000) {
     if (isPeak(lastValues[1], lastValues[0], lastValues[2]) &&
         lastValues[1] > threshold && delta > 80) {
 
       unsigned long now = millis();
       unsigned long diff = now - lastBeatTime;
-      if (diff > 450) {
+      if (diff > 460) {
         float instantBPM = 60000.0 / diff;
         lastBeatTime = now;
 
@@ -179,12 +162,11 @@ void loop() {
           bpmSum += instantBPM;
           bpmCount++;
           bpm = bpmSum / bpmCount;
-
           if (bpmCount > 5) {
             bpmSum -= bpmSum / bpmCount;
             bpmCount--;
           }
-
+          irValido = true;
           Serial.print("❤️ BPM filtrado: ");
           Serial.println(bpm, 1);
         } else {
@@ -232,9 +214,7 @@ void loop() {
     if (bpm > 0) {
       enviarDatos(distanciaTotal, velocidad, distanciaRapida, bpm,
                   accelTotal, accelIzq, accelDer, saltoAltura);
-    } else {
-      Serial.println("⏳ Esperando BPM válido...");
-    }
+    saltoMaximo = 0.0;
     tiempoUltimoEnvio = millis();
   }
 
